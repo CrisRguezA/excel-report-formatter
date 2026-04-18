@@ -2,19 +2,27 @@
 formatter.py
 
 ES:
-Genera un reporte Excel profesional a partir de datos de ventas limpios.
-Produce tres hojas: KPIs (métricas clave), Pivot (tablas cruzadas) y
-Charts (gráficos de barras y tarta).
+Genera un reporte semanal Excel profesional a partir de un dataset ya limpio.
+Produce una hoja principal (Weekly_Report) con título, tabla formateada,
+colores condicionales por estado y certificación, fila de totales,
+y una hoja secundaria (Report_Info) con metadatos.
+
+Implementado con pandas + xlsxwriter.
+Arquitectura abierta a extensiones con openpyxl si se requiere post-edición.
 
 Contrato del pipeline:
-    generate_report(input_path: str, output_path: str) -> None
+    run_formatter(input_path: str, output_path: str) -> None
     input_path  : ruta al Excel limpio (output del excel-data-cleaner)
-    output_path : ruta donde se guarda el reporte final
+    output_path : ruta donde se guarda el reporte semanal
 
 EN:
-Generates a professional Excel report from clean sales data.
-Produces three sheets: KPIs (key metrics), Pivot (cross tables) and
-Charts (bar and pie charts).
+Generates a professional weekly Excel report from an already-clean dataset.
+Produces a main sheet (Weekly_Report) with title, formatted table,
+conditional colours by estado and certificacion, totals row,
+and a secondary sheet (Report_Info) with report metadata.
+
+Implemented with pandas + xlsxwriter.
+Open to openpyxl extensions for post-processing if needed.
 """
 
 # ------------------------------------------------------------------
@@ -22,368 +30,401 @@ Charts (bar and pie charts).
 # ------------------------------------------------------------------
 
 import pandas as pd
-from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.utils import get_column_letter
-from openpyxl.chart import BarChart, PieChart, Reference
-from openpyxl.chart.series import DataPoint
+import xlsxwriter
+from datetime import datetime
+from pathlib import Path
 
 
 # ------------------------------------------------------------------
-# STYLE CONSTANTS  (reutilizados de formatting.py del cleaner)
+# STYLE CONSTANTS
 # ------------------------------------------------------------------
 
-HEADER_FILL_BLUE  = PatternFill("solid", start_color="1F4E79", end_color="1F4E79")
-HEADER_FILL_GREEN = PatternFill("solid", start_color="375623", end_color="375623")
-HEADER_FILL_DARK  = PatternFill("solid", start_color="2E4057", end_color="2E4057")
-KPI_LABEL_FILL    = PatternFill("solid", start_color="D6E4F0", end_color="D6E4F0")
-KPI_VALUE_FILL    = PatternFill("solid", start_color="EBF3FB", end_color="EBF3FB")
-ALT_FILL          = PatternFill("solid", start_color="EBF3FB", end_color="EBF3FB")
+HEADER_BG        = "#1F4E79"
+HEADER_FONT_COL  = "#FFFFFF"
+ALT_BG           = "#EBF3FB"
+TITLE_BG         = "#D6E4F0"
+TOTALS_BG        = "#1F4E79"
+TOTALS_FONT_COL  = "#FFFFFF"
 
-HEADER_FONT  = Font(name="Arial", bold=True, color="FFFFFF", size=11)
-TITLE_FONT   = Font(name="Arial", bold=True, color="1F4E79", size=14)
-LABEL_FONT   = Font(name="Arial", bold=True, size=10)
-BODY_FONT    = Font(name="Arial", size=10)
-KPI_VAL_FONT = Font(name="Arial", bold=True, size=12, color="1F4E79")
+# Colores condicionales por estado
+# Regla de negocio: estado tiene prioridad sobre certificacion sobre zebra
+# Documentar en README si se añaden nuevos valores al pipeline
+COLOR_CERRADO    = "#C6EFCE"   # verde suave
+COLOR_PENDIENTE  = "#FFEB9C"   # amarillo suave
+COLOR_CANCELADO  = "#FFC7CE"   # rojo suave — contemplado aunque no existe en v1 del cleaner
 
-THIN_BORDER = Border(
-    left=Side(style="thin"),
-    right=Side(style="thin"),
-    top=Side(style="thin"),
-    bottom=Side(style="thin"),
-)
+# Colores condicionales por certificacion (solo si estado no aplica color)
+COLOR_FSC        = "#E2EFDA"   # verde muy suave
+COLOR_PEFC       = "#EBF3FB"   # azul muy suave
+COLOR_CE         = "#FFF2CC"   # amarillo muy suave
+COLOR_SIN_CERT   = "#F2F2F2"   # gris suave
 
-CENTER = Alignment(horizontal="center", vertical="center")
-LEFT   = Alignment(horizontal="left",   vertical="center")
-
-
-# ------------------------------------------------------------------
-# HELPERS
-# ------------------------------------------------------------------
-
-def _autofit_columns(ws, min_width=10, max_width=40):
-    for col in ws.columns:
-        max_len = 0
-        col_letter = get_column_letter(col[0].column)
-        for cell in col:
-            try:
-                max_len = max(max_len, len(str(cell.value or "")))
-            except Exception:
-                pass
-        ws.column_dimensions[col_letter].width = min(max(max_len + 2, min_width), max_width)
-
-
-def _apply_header_row(ws, fill):
-    for cell in ws[1]:
-        cell.font  = HEADER_FONT
-        cell.fill  = fill
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        cell.border = THIN_BORDER
-
-
-def _style_table(ws, header_fill):
-    """Aplica estilo completo a una tabla: encabezado + cuerpo + autofit."""
-    _apply_header_row(ws, header_fill)
-    for i, row in enumerate(ws.iter_rows(min_row=2), start=2):
-        fill = ALT_FILL if i % 2 == 0 else PatternFill()
-        for cell in row:
-            cell.font   = BODY_FONT
-            cell.border = THIN_BORDER
-            cell.fill   = fill
-            cell.alignment = CENTER
-    _autofit_columns(ws)
-    ws.row_dimensions[1].height = 28
+# Columnas requeridas — contrato con excel-data-cleaner
+# NOTE (Gepeta): separar en obligatorias/opcionales si el formatter
+# se reutiliza en otros pipelines con esquemas distintos
+REQUIRED_COLUMNS = [
+    "id_venta", "cliente", "fecha_venta", "producto", "tipo_madera",
+    "certificacion", "cantidad_m3", "precio_m3", "importe", "estado",
+    "comercial", "pais"
+]
 
 
 # ------------------------------------------------------------------
-# SHEET 1 — KPIs
+# LOAD & VALIDATE
 # ------------------------------------------------------------------
 
-def _build_kpis(ws, df):
-    """Construye la hoja KPIs con métricas clave de ventas y certificación."""
+def load_clean_excel(input_path: str) -> pd.DataFrame:
+    """Carga el Excel limpio y devuelve un DataFrame."""
+    path = Path(input_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Archivo no encontrado: {path}")
+    df = pd.read_excel(path)
+    print(f"  ✓ Cargado: {path.name} — {df.shape[0]} filas × {df.shape[1]} columnas")
+    return df
 
-    # --- Cálculos ---
-    total_ventas      = len(df)
-    importe_total     = df["importe"].sum()
-    ticket_medio      = df["importe"].mean()
-    ventas_cerradas   = (df["estado"] == "Cerrado").sum()
-    pct_cerradas      = ventas_cerradas / total_ventas * 100
 
-    certificadas      = df[df["certificacion"] != "Sin certificación"]
-    total_cert        = len(certificadas)
-    pct_certificadas  = total_cert / total_ventas * 100
-    importe_cert      = certificadas["importe"].sum()
-    importe_no_cert   = df[df["certificacion"] == "Sin certificación"]["importe"].sum()
+def validate_required_columns(df: pd.DataFrame) -> None:
+    """Verifica que el DataFrame tenga las columnas esperadas del pipeline."""
+    missing = [col for col in REQUIRED_COLUMNS if col not in df.columns]
+    if missing:
+        raise ValueError(f"Columnas faltantes en el input: {missing}")
+    print(f"  ✓ Columnas validadas")
 
-    # --- Título ---
-    ws.merge_cells("B2:D2")
-    title_cell = ws["B2"]
-    title_cell.value     = "Reporte de Ventas — KPIs"
-    title_cell.font      = TITLE_FONT
-    title_cell.alignment = CENTER
 
-    # --- Datos de las tarjetas KPI ---
-    kpis = [
-        ("Total de ventas",              total_ventas,       "#"),
-        ("Importe total",                importe_total,      "€"),
-        ("Ticket medio",                 ticket_medio,       "€"),
-        ("Ventas cerradas",              ventas_cerradas,    "#"),
-        ("% ventas cerradas",            pct_cerradas,       "%"),
-        ("Ventas certificadas",          total_cert,         "#"),
-        ("% ventas certificadas",        pct_certificadas,   "%"),
-        ("Importe certificado",          importe_cert,       "€"),
-        ("Importe sin certificación",    importe_no_cert,    "€"),
+# ------------------------------------------------------------------
+# FORMAT HELPER
+# ------------------------------------------------------------------
+
+def _fmt(workbook, bg: str, extra: dict | None = None) -> object:
+    """
+    Crea un formato xlsxwriter con base común + overrides.
+    Usa None como valor por defecto para evitar el riesgo del dict mutable.
+    """
+    extra = extra or {}
+    base = {
+        "font_name": "Arial", "font_size": 10,
+        "border": 1, "valign": "vcenter", "bg_color": bg
+    }
+    return workbook.add_format({**base, **extra})
+
+
+# ------------------------------------------------------------------
+# FORMAT CACHE
+# ------------------------------------------------------------------
+
+def build_format_cache(workbook) -> dict:
+    """
+    Crea todos los formatos de celda una sola vez y los devuelve en un dict.
+    Evita llamar a workbook.add_format() dentro del bucle fila/columna,
+    lo que escalaría mal en archivos grandes.
+
+    Clave del dict: (bg_color, num_format, align)
+    """
+    # Todos los fondos posibles
+    backgrounds = [
+        COLOR_CERRADO, COLOR_PENDIENTE, COLOR_CANCELADO,
+        COLOR_FSC, COLOR_PEFC, COLOR_CE, COLOR_SIN_CERT,
+        ALT_BG, "#FFFFFF"
     ]
 
-    # --- Escribir tarjetas (fila inicio: 4) ---
-    ws.column_dimensions["A"].width = 3   # margen izquierdo
-    ws.column_dimensions["B"].width = 30
-    ws.column_dimensions["C"].width = 18
-    ws.column_dimensions["D"].width = 8
+    # Combinaciones de (num_format, align) por tipo de columna
+    type_variants = [
+        (None,           "left"),    # texto izquierda
+        (None,           "center"),  # texto centro
+        ("DD/MM/YYYY",   "center"),  # fecha
+        ("#,##0.00 €",   "center"),  # euro
+        ("#,##0.00",     "center"),  # decimal
+        ("0",            "center"),  # entero
+    ]
 
-    start_row = 4
-    for i, (label, value, unit) in enumerate(kpis):
-        row = start_row + i
+    cache = {}
+    for bg in backgrounds:
+        for (num_format, align) in type_variants:
+            extra = {"align": align}
+            if num_format:
+                extra["num_format"] = num_format
+            key = (bg, num_format, align)
+            cache[key] = _fmt(workbook, bg, extra)
 
-        # Etiqueta
-        label_cell = ws.cell(row=row, column=2, value=label)
-        label_cell.font      = LABEL_FONT
-        label_cell.fill      = KPI_LABEL_FILL
-        label_cell.border    = THIN_BORDER
-        label_cell.alignment = LEFT
+    return cache
 
-        # Valor formateado
-        if unit == "€":
-            display = f"{value:,.2f} €"
-        elif unit == "%":
-            display = f"{value:.1f} %"
+
+# ------------------------------------------------------------------
+# ROW COLOR LOGIC
+# ------------------------------------------------------------------
+
+def _row_bg(estado: str, cert: str, row_idx: int) -> str:
+    """
+    Determina el color de fondo de una fila según esta prioridad:
+      1. estado  (Cerrado / Pendiente / Cancelado)
+      2. certificacion (FSC / PEFC / CE / Sin certificación)
+      3. zebra striping (alterno)
+
+    Regla de negocio explícita — documentar en README si cambia.
+    """
+    estado_color = {
+        "Cerrado":   COLOR_CERRADO,
+        "Pendiente": COLOR_PENDIENTE,
+        "Cancelado": COLOR_CANCELADO,
+    }
+    cert_color = {
+        "FSC":               COLOR_FSC,
+        "PEFC":              COLOR_PEFC,
+        "CE":                COLOR_CE,
+        "Sin certificación": COLOR_SIN_CERT,
+    }
+
+    if estado in estado_color:
+        return estado_color[estado]
+    if cert in cert_color:
+        return cert_color[cert]
+    return ALT_BG if row_idx % 2 == 0 else "#FFFFFF"
+
+
+# ------------------------------------------------------------------
+# TOTALS SUMMARY
+# ------------------------------------------------------------------
+
+def build_totals_summary(df: pd.DataFrame) -> str:
+    """
+    Construye el texto resumen de la fila de totales.
+    Separado de add_totals_row() para desacoplar cálculo y presentación.
+    """
+    total_ventas   = len(df)
+    total_cerradas = int((df["estado"] == "Cerrado").sum())
+    pct_cerradas   = total_cerradas / total_ventas * 100 if total_ventas > 0 else 0
+    return f"{total_ventas} ventas ({total_cerradas} cerradas — {pct_cerradas:.0f}%)"
+
+
+# ------------------------------------------------------------------
+# WRITE TITLE ROW
+# ------------------------------------------------------------------
+
+def _write_title(ws, workbook, n_cols: int) -> None:
+    """Escribe la fila de título con fecha de generación."""
+    title_fmt = workbook.add_format({
+        "font_name": "Arial", "font_size": 13, "bold": True,
+        "bg_color": TITLE_BG, "font_color": "#1F4E79",
+        "align": "left", "valign": "vcenter"
+    })
+    fecha_gen = datetime.now().strftime("%d/%m/%Y")
+    ws.merge_range(0, 0, 0, n_cols - 1,
+                   f"Reporte Semanal de Ventas — Generado: {fecha_gen}", title_fmt)
+    ws.set_row(0, 24)
+
+
+# ------------------------------------------------------------------
+# WRITE HEADER ROW
+# ------------------------------------------------------------------
+
+def _write_header(ws, workbook, df: pd.DataFrame) -> None:
+    """Escribe la fila de cabecera con estilo."""
+    header_fmt = workbook.add_format({
+        "font_name": "Arial", "font_size": 11, "bold": True, "border": 1,
+        "bg_color": HEADER_BG, "font_color": HEADER_FONT_COL,
+        "align": "center", "valign": "vcenter"
+    })
+    for col_idx, col_name in enumerate(df.columns):
+        ws.write(1, col_idx, col_name, header_fmt)
+    ws.set_row(1, 22)
+
+
+# ------------------------------------------------------------------
+# WRITE DATA ROWS
+# ------------------------------------------------------------------
+
+def apply_column_formats(ws, df: pd.DataFrame, fmt_cache: dict) -> None:
+    """
+    Escribe las filas de datos usando el caché de formatos.
+    El color de fondo se determina por _row_bg() — estado > cert > zebra.
+    """
+    col_type = {
+        "id_venta":      ("0",          "center"),
+        "cliente":       (None,         "left"),
+        "fecha_venta":   ("DD/MM/YYYY", "center"),
+        "producto":      (None,         "left"),
+        "tipo_madera":   (None,         "left"),
+        "certificacion": (None,         "left"),
+        "cantidad_m3":   ("#,##0.00",   "center"),
+        "precio_m3":     ("#,##0.00 €", "center"),
+        "importe":       ("#,##0.00 €", "center"),
+        "estado":        (None,         "center"),
+        "comercial":     (None,         "left"),
+        "pais":          (None,         "left"),
+    }
+
+    col_names = list(df.columns)
+
+    for row_idx, (_, row) in enumerate(df.iterrows()):
+        estado  = str(row.get("estado", ""))
+        cert    = str(row.get("certificacion", ""))
+        bg      = _row_bg(estado, cert, row_idx)
+        excel_row = row_idx + 2
+
+        for col_idx, col_name in enumerate(col_names):
+            value = row[col_name]
+            try:
+                if pd.isna(value):
+                    value = None
+            except (TypeError, ValueError):
+                pass
+
+            num_fmt, align = col_type.get(col_name, (None, "left"))
+            cell_fmt = fmt_cache[(bg, num_fmt, align)]
+
+            if value is None:
+                ws.write_blank(excel_row, col_idx, None, cell_fmt)
+            else:
+                ws.write(excel_row, col_idx, value, cell_fmt)
+
+
+# ------------------------------------------------------------------
+# WRITE TOTALS ROW
+# ------------------------------------------------------------------
+
+def add_totals_row(ws, workbook, df: pd.DataFrame) -> None:
+    """Escribe la fila de totales al final de la tabla."""
+    n_rows      = len(df)
+    n_cols      = len(df.columns)
+    tot_row     = n_rows + 2
+    col_names   = list(df.columns)
+    importe_idx = col_names.index("importe")
+    cliente_idx = col_names.index("cliente")
+
+    totals_base = {
+        "font_name": "Arial", "font_size": 10, "bold": True, "border": 1,
+        "bg_color": TOTALS_BG, "font_color": TOTALS_FONT_COL, "valign": "vcenter"
+    }
+    totals_label_fmt = workbook.add_format({**totals_base, "align": "left"})
+    totals_fmt       = workbook.add_format({**totals_base, "align": "center"})
+    totals_num_fmt   = workbook.add_format({**totals_base, "align": "center",
+                                            "num_format": "#,##0.00 €"})
+
+    ws.write(tot_row, 0, "TOTALES", totals_label_fmt)
+    ws.write(tot_row, cliente_idx, build_totals_summary(df), totals_fmt)
+    ws.write(tot_row, importe_idx, df["importe"].sum(), totals_num_fmt)
+
+    filled = {0, cliente_idx, importe_idx}
+    for col_idx in range(n_cols):
+        if col_idx not in filled:
+            ws.write_blank(tot_row, col_idx, None, totals_fmt)
+
+    ws.set_row(tot_row, 20)
+
+
+# ------------------------------------------------------------------
+# AUTOFIT COLUMNS
+# ------------------------------------------------------------------
+
+def autofit_columns(ws, df: pd.DataFrame) -> None:
+    """Ajusta el ancho de columna al contenido máximo."""
+    for col_idx, col_name in enumerate(df.columns):
+        if col_name == "fecha_venta":
+            width = 14
         else:
-            display = str(int(value))
-
-        value_cell = ws.cell(row=row, column=3, value=display)
-        value_cell.font      = KPI_VAL_FONT
-        value_cell.fill      = KPI_VALUE_FILL
-        value_cell.border    = THIN_BORDER
-        value_cell.alignment = CENTER
-
-        ws.row_dimensions[row].height = 22
-
-    ws.sheet_view.showGridLines = False
+            try:
+                max_len = max(
+                    df[col_name].dropna().astype(str).map(len).max(),
+                    len(col_name)
+                )
+                width = min(max_len + 2, 40)
+            except (ValueError, TypeError):
+                width = 12
+        ws.set_column(col_idx, col_idx, width)
 
 
 # ------------------------------------------------------------------
-# SHEET 2 — Pivot
+# WRITE REPORT SHEET
 # ------------------------------------------------------------------
 
-def _build_pivot(ws, df):
-    """Construye dos tablas pivot: comercial×producto y certificacion×producto."""
+def write_report_sheet(workbook, df: pd.DataFrame) -> None:
+    """
+    Orquesta la escritura de la hoja Weekly_Report:
+      1. Crear hoja y caché de formatos
+      2. Título
+      3. Cabecera
+      4. Datos con formato condicional
+      5. Totales
+      6. Anchos de columna, freeze y filtro
+    """
+    ws        = workbook.add_worksheet("Weekly_Report")
+    n_rows    = len(df)
+    n_cols    = len(df.columns)
+    fmt_cache = build_format_cache(workbook)
 
-    # --- Pivot 1: Importe por Comercial × Producto ---
-    pivot1 = df.pivot_table(
-        index="comercial",
-        columns="producto",
-        values="importe",
-        aggfunc="sum",
-        fill_value=0
-    ).reset_index()
-    pivot1.columns.name = None
+    _write_title(ws, workbook, n_cols)
+    _write_header(ws, workbook, df)
+    apply_column_formats(ws, df, fmt_cache)
+    add_totals_row(ws, workbook, df)
+    autofit_columns(ws, df)
 
-    # Título
-    ws["A1"] = "Importe por Comercial y Producto (€)"
-    ws["A1"].font      = TITLE_FONT
-    ws["A1"].alignment = LEFT
-    ws.row_dimensions[1].height = 28
-
-    # Encabezados
-    headers1 = list(pivot1.columns)
-    for col_idx, header in enumerate(headers1, start=1):
-        cell = ws.cell(row=2, column=col_idx, value=header)
-        cell.font      = HEADER_FONT
-        cell.fill      = HEADER_FILL_BLUE
-        cell.alignment = CENTER
-        cell.border    = THIN_BORDER
-
-    # Datos pivot1
-    for row_idx, row_data in enumerate(pivot1.itertuples(index=False), start=3):
-        for col_idx, value in enumerate(row_data, start=1):
-            cell = ws.cell(row=row_idx, column=col_idx, value=value)
-            cell.font      = BODY_FONT
-            cell.border    = THIN_BORDER
-            cell.alignment = CENTER
-            if row_idx % 2 == 0:
-                cell.fill = ALT_FILL
-
-    # --- Pivot 2: Importe por Certificación × Producto ---
-    pivot2 = df.pivot_table(
-        index="certificacion",
-        columns="producto",
-        values="importe",
-        aggfunc="sum",
-        fill_value=0
-    ).reset_index()
-    pivot2.columns.name = None
-
-    offset_row = len(pivot1) + 5  # separación entre tablas
-
-    ws.cell(row=offset_row, column=1).value     = "Importe por Certificación y Producto (€)"
-    ws.cell(row=offset_row, column=1).font      = TITLE_FONT
-    ws.cell(row=offset_row, column=1).alignment = LEFT
-    ws.row_dimensions[offset_row].height = 28
-
-    headers2 = list(pivot2.columns)
-    for col_idx, header in enumerate(headers2, start=1):
-        cell = ws.cell(row=offset_row + 1, column=col_idx, value=header)
-        cell.font      = HEADER_FONT
-        cell.fill      = HEADER_FILL_GREEN
-        cell.alignment = CENTER
-        cell.border    = THIN_BORDER
-
-    for row_idx, row_data in enumerate(pivot2.itertuples(index=False), start=offset_row + 2):
-        for col_idx, value in enumerate(row_data, start=1):
-            cell = ws.cell(row=row_idx, column=col_idx, value=value)
-            cell.font      = BODY_FONT
-            cell.border    = THIN_BORDER
-            cell.alignment = CENTER
-            if row_idx % 2 == 0:
-                cell.fill = ALT_FILL
-
-    _autofit_columns(ws)
+    ws.freeze_panes(2, 0)
+    ws.autofilter(1, 0, n_rows + 1, n_cols - 1)
 
 
 # ------------------------------------------------------------------
-# SHEET 3 — Charts
+# REPORT INFO SHEET
 # ------------------------------------------------------------------
 
-def _build_charts(ws, df):
-    """Construye 4 gráficos: barras por producto, tarta estado,
-    tarta certificación, tarta tipo madera."""
+def write_info_sheet(workbook, df: pd.DataFrame, input_path: str) -> None:
+    """Escribe la hoja Report_Info con metadatos del reporte."""
+    ws = workbook.add_worksheet("Report_Info")
 
-    # --- Datos auxiliares escritos en la hoja (base para los gráficos) ---
+    label_fmt = workbook.add_format({
+        "font_name": "Arial", "font_size": 10, "bold": True,
+        "bg_color": "#D6E4F0", "border": 1, "align": "left"
+    })
+    value_fmt = workbook.add_format({
+        "font_name": "Arial", "font_size": 10,
+        "bg_color": "#EBF3FB", "border": 1, "align": "left"
+    })
 
-    # 1. Importe por producto
-    prod_data = df.groupby("producto")["importe"].sum().reset_index()
-    ws["A1"] = "Producto"
-    ws["B1"] = "Importe"
-    for i, row in prod_data.iterrows():
-        ws.cell(row=i+2, column=1, value=row["producto"])
-        ws.cell(row=i+2, column=2, value=row["importe"])
+    cerradas = int((df["estado"] == "Cerrado").sum())
+    cert     = int((df["certificacion"] != "Sin certificación").sum())
 
-    # 2. Ventas por estado
-    est_data = df["estado"].value_counts().reset_index()
-    est_data.columns = ["estado", "count"]
-    ws["D1"] = "Estado"
-    ws["E1"] = "Ventas"
-    for i, row in est_data.iterrows():
-        ws.cell(row=i+2, column=4, value=row["estado"])
-        ws.cell(row=i+2, column=5, value=row["count"])
+    meta = [
+        ("Proyecto",            "excel-report-formatter"),
+        ("Archivo fuente",      Path(input_path).name),
+        ("Fecha generación",    datetime.now().strftime("%d/%m/%Y %H:%M")),
+        ("Total filas",         str(len(df))),
+        ("Ventas cerradas",     str(cerradas)),
+        ("Ventas certificadas", str(cert)),
+        ("Columnas",            str(len(df.columns))),
+        ("Pipeline",            "excel-data-cleaner → excel-report-formatter"),
+    ]
 
-    # 3. Ventas por certificación
-    cert_data = df["certificacion"].value_counts().reset_index()
-    cert_data.columns = ["certificacion", "count"]
-    ws["G1"] = "Certificación"
-    ws["H1"] = "Ventas"
-    for i, row in cert_data.iterrows():
-        ws.cell(row=i+2, column=7, value=row["certificacion"])
-        ws.cell(row=i+2, column=8, value=row["count"])
+    ws.set_column(0, 0, 25)
+    ws.set_column(1, 1, 45)
 
-    # 4. Ventas por tipo madera
-    mad_data = df["tipo_madera"].value_counts().reset_index()
-    mad_data.columns = ["tipo_madera", "count"]
-    ws["J1"] = "Tipo Madera"
-    ws["K1"] = "Ventas"
-    for i, row in mad_data.iterrows():
-        ws.cell(row=i+2, column=10, value=row["tipo_madera"])
-        ws.cell(row=i+2, column=11, value=row["count"])
+    for row_idx, (label, value) in enumerate(meta):
+        ws.write(row_idx, 0, label, label_fmt)
+        ws.write(row_idx, 1, value, value_fmt)
+        ws.set_row(row_idx, 20)
 
-    n_prod = len(prod_data)
-    n_est  = len(est_data)
-    n_cert = len(cert_data)
-    n_mad  = len(mad_data)
-
-    # --- Gráfico 1: Barras — Importe por Producto ---
-    bar = BarChart()
-    bar.type    = "col"
-    bar.title   = "Importe por Producto (€)"
-    bar.y_axis.title = "Importe (€)"
-    bar.x_axis.title = "Producto"
-    bar.style   = 10
-    bar.width   = 14
-    bar.height  = 10
-
-    data_ref = Reference(ws, min_col=2, min_row=1, max_row=n_prod+1)
-    cats_ref = Reference(ws, min_col=1, min_row=2, max_row=n_prod+1)
-    bar.add_data(data_ref, titles_from_data=True)
-    bar.set_categories(cats_ref)
-    ws.add_chart(bar, "A10")
-
-    # --- Gráfico 2: Tarta — Ventas por Estado ---
-    pie_est = PieChart()
-    pie_est.title  = "Ventas por Estado"
-    pie_est.style  = 10
-    pie_est.width  = 12
-    pie_est.height = 10
-
-    data_ref2 = Reference(ws, min_col=5, min_row=1, max_row=n_est+1)
-    cats_ref2 = Reference(ws, min_col=4, min_row=2, max_row=n_est+1)
-    pie_est.add_data(data_ref2, titles_from_data=True)
-    pie_est.set_categories(cats_ref2)
-    ws.add_chart(pie_est, "F10")
-
-    # --- Gráfico 3: Tarta — Ventas por Certificación ---
-    pie_cert = PieChart()
-    pie_cert.title  = "Ventas por Certificación"
-    pie_cert.style  = 10
-    pie_cert.width  = 12
-    pie_cert.height = 10
-
-    data_ref3 = Reference(ws, min_col=8, min_row=1, max_row=n_cert+1)
-    cats_ref3 = Reference(ws, min_col=7, min_row=2, max_row=n_cert+1)
-    pie_cert.add_data(data_ref3, titles_from_data=True)
-    pie_cert.set_categories(cats_ref3)
-    ws.add_chart(pie_cert, "A28")
-
-    # --- Gráfico 4: Tarta — Ventas por Tipo de Madera ---
-    pie_mad = PieChart()
-    pie_mad.title  = "Ventas por Tipo de Madera"
-    pie_mad.style  = 10
-    pie_mad.width  = 12
-    pie_mad.height = 10
-
-    data_ref4 = Reference(ws, min_col=11, min_row=1, max_row=n_mad+1)
-    cats_ref4 = Reference(ws, min_col=10, min_row=2, max_row=n_mad+1)
-    pie_mad.add_data(data_ref4, titles_from_data=True)
-    pie_mad.set_categories(cats_ref4)
-    ws.add_chart(pie_mad, "F28")
-
-    ws.sheet_view.showGridLines = False
+    ws.hide_gridlines(2)
 
 
 # ------------------------------------------------------------------
-# MAIN FUNCTION
+# MAIN ENTRY POINT
 # ------------------------------------------------------------------
 
-def generate_report(input_path: str, output_path: str) -> None:
+def run_formatter(input_path: str, output_path: str) -> None:
     """
     Punto de entrada principal.
-    Lee el Excel limpio, genera el reporte con 3 hojas y lo guarda.
+    Carga el Excel limpio, genera el reporte semanal y lo guarda.
 
     Args:
         input_path  : ruta al Excel limpio (output del excel-data-cleaner)
-        output_path : ruta donde se guarda el reporte final
+        output_path : ruta donde se guarda el reporte semanal
     """
-    df = pd.read_excel(input_path)
+    df = load_clean_excel(input_path)
+    validate_required_columns(df)
 
-    wb = Workbook()
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    workbook = xlsxwriter.Workbook(output_path)
 
-    # Renombrar hoja por defecto y crear las demás
-    ws_kpis   = wb.active
-    ws_kpis.title = "KPIs"
-    ws_pivot  = wb.create_sheet("Pivot")
-    ws_charts = wb.create_sheet("Charts")
+    write_report_sheet(workbook, df)
+    write_info_sheet(workbook, df, input_path)
 
-    _build_kpis(ws_kpis, df)
-    _build_pivot(ws_pivot, df)
-    _build_charts(ws_charts, df)
-
-    wb.save(output_path)
-    print(f"✓ Reporte generado: {output_path}")
+    workbook.close()
+    print(f"  ✓ Reporte guardado: {output_path}")
