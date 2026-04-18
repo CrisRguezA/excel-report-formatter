@@ -60,8 +60,8 @@ COLOR_CE         = "#FFF2CC"   # amarillo muy suave
 COLOR_SIN_CERT   = "#F2F2F2"   # gris suave
 
 # Columnas requeridas — contrato con excel-data-cleaner
-# NOTE (Gepeta): separar en obligatorias/opcionales si el formatter
-# se reutiliza en otros pipelines con esquemas distintos
+# Posible mejora futura: separar en obligatorias/opcionales
+# si el formatter se reutiliza con esquemas distintos
 REQUIRED_COLUMNS = [
     "id_venta", "cliente", "fecha_venta", "producto", "tipo_madera",
     "certificacion", "cantidad_m3", "precio_m3", "importe", "estado",
@@ -317,10 +317,20 @@ def add_totals_row(ws, workbook, df: pd.DataFrame) -> None:
 # ------------------------------------------------------------------
 
 def autofit_columns(ws, df: pd.DataFrame) -> None:
-    """Ajusta el ancho de columna al contenido máximo."""
+    """
+    Ajusta el ancho de columna al contenido máximo.
+    Columnas clave con ancho fijo para mejor presentación visual.
+    """
+    fixed_widths = {
+        "fecha_venta": 14,
+        "cliente":     28,
+        "producto":    18,
+        "comercial":   14,
+        "importe":     16,
+    }
     for col_idx, col_name in enumerate(df.columns):
-        if col_name == "fecha_venta":
-            width = 14
+        if col_name in fixed_widths:
+            width = fixed_widths[col_name]
         else:
             try:
                 max_len = max(
