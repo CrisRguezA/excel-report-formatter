@@ -55,7 +55,7 @@ COLOR_CANCELADO  = "#FFC7CE"   # rojo suave — contemplado aunque no existe en 
 
 # Colores condicionales por certificacion (solo si estado no aplica color)
 COLOR_FSC        = "#E2EFDA"   # verde muy suave
-COLOR_PEFC       = "#EBF3FB"   # azul muy suave
+COLOR_PEFC       = "#BDD7EE"   # azul
 COLOR_CE         = "#FFF2CC"   # amarillo muy suave
 COLOR_SIN_CERT   = "#F2F2F2"   # gris suave
 
@@ -153,32 +153,35 @@ def build_format_cache(workbook) -> dict:
 # ROW COLOR LOGIC
 # ------------------------------------------------------------------
 
-def _row_bg(estado: str, cert: str, row_idx: int) -> str:
+def _row_bg_by_estado(estado: str, row_idx: int) -> str:
     """
-    Determina el color de fondo de una fila según esta prioridad:
-      1. estado  (Cerrado / Pendiente / Cancelado)
-      2. certificacion (FSC / PEFC / CE / Sin certificación)
-      3. zebra striping (alterno)
+    Determina el color de fondo de la fila completa según estado.
+    Zebra striping solo como fallback si no hay estado reconocido.
 
-    Regla de negocio explícita — documentar en README si cambia.
+    Regla de negocio: fila coloreada por estado operativo.
+    Documentar en README si se añaden nuevos valores al pipeline.
     """
     estado_color = {
         "Cerrado":   COLOR_CERRADO,
         "Pendiente": COLOR_PENDIENTE,
         "Cancelado": COLOR_CANCELADO,
     }
+    return estado_color.get(estado, ALT_BG if row_idx % 2 == 0 else "#FFFFFF")
+
+
+def _cert_bg(cert: str) -> str:
+    """
+    Devuelve el color de fondo específico para la celda de certificacion.
+    Se aplica independientemente del color de fila — permite leer
+    dos dimensiones a la vez: estado operativo + clasificación documental.
+    """
     cert_color = {
         "FSC":               COLOR_FSC,
         "PEFC":              COLOR_PEFC,
         "CE":                COLOR_CE,
         "Sin certificación": COLOR_SIN_CERT,
     }
-
-    if estado in estado_color:
-        return estado_color[estado]
-    if cert in cert_color:
-        return cert_color[cert]
-    return ALT_BG if row_idx % 2 == 0 else "#FFFFFF"
+    return cert_color.get(cert, "#FFFFFF")
 
 
 # ------------------------------------------------------------------
@@ -236,7 +239,9 @@ def _write_header(ws, workbook, df: pd.DataFrame) -> None:
 def apply_column_formats(ws, df: pd.DataFrame, fmt_cache: dict) -> None:
     """
     Escribe las filas de datos usando el caché de formatos.
-    El color de fondo se determina por _row_bg() — estado > cert > zebra.
+    - Color de fila: determinado por estado operativo
+    - Celda certificacion: color propio independiente del color de fila
+    Permite leer dos dimensiones simultáneamente en el reporte.
     """
     col_type = {
         "id_venta":      ("0",          "center"),
@@ -256,9 +261,9 @@ def apply_column_formats(ws, df: pd.DataFrame, fmt_cache: dict) -> None:
     col_names = list(df.columns)
 
     for row_idx, (_, row) in enumerate(df.iterrows()):
-        estado  = str(row.get("estado", ""))
-        cert    = str(row.get("certificacion", ""))
-        bg      = _row_bg(estado, cert, row_idx)
+        estado    = str(row.get("estado", ""))
+        cert      = str(row.get("certificacion", ""))
+        row_bg    = _row_bg_by_estado(estado, row_idx)
         excel_row = row_idx + 2
 
         for col_idx, col_name in enumerate(col_names):
@@ -270,6 +275,9 @@ def apply_column_formats(ws, df: pd.DataFrame, fmt_cache: dict) -> None:
                 pass
 
             num_fmt, align = col_type.get(col_name, (None, "left"))
+
+            # Celda de certificacion: color propio independiente de la fila
+            bg = _cert_bg(cert) if col_name == "certificacion" else row_bg
             cell_fmt = fmt_cache[(bg, num_fmt, align)]
 
             if value is None:
