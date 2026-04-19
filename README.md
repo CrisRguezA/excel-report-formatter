@@ -46,7 +46,7 @@ Un archivo Excel listo para uso en oficina con:
 ![Weekly Report](docs/screenshots/weekly_report_sheet.png)
 
 **Hoja Report_Info**
-![Report Info](docs/screenshots/info_report_sheet.png)
+![Report Info](docs/screenshots/report_info_sheet.png)
 
 ---
 
